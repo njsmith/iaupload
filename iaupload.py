@@ -1,5 +1,9 @@
 # Some code for uploading very large files to the Internet Archive
 
+# Haven't tested on py2 at all, but maybe this will improve your changes :-)
+from __future__ import (
+    division, print_function, absolute_import)
+
 import os
 import os.path
 import socket
@@ -15,23 +19,22 @@ if not set(os.environ).issuperset(["IA_ACCESS_KEY_ID",
     raise RuntimeError("Please set IA_ACCESS_KEY_ID and "
                        "IA_SECRET_ACCESS_KEY envvars")
 
-# Only execute this debugging thing one pers session
-if "_already_loaded" not in globals():
-    boto3.set_stream_logger(name="botocore")
-    _already_loaded = True
+# Only execute this debugging thing one per session
+# if "_already_loaded" not in globals():
+#     boto3.set_stream_logger(name="botocore")
+#     _already_loaded = True
 
-# def tell_me_more(*args, **kwargs):
-#     print(args, kwargs)
 
-def make_add_headers_handler(extra_headers):
+def make_extra_headers_handler(extra_headers):
     # This callback will get run just before an actual request is made (if
     # it's registered as a handler for the appropriate "before-call" event),
     # and has a chance to mess with the request before it happens.
-    def add_headers_handler(**kwargs):
+    def extra_headers_handler(**kwargs):
         kwargs["params"]["headers"].update(extra_headers)
         # In the botocore event system, 'None' means 'continue processing'
         return None
-    return add_headers_handler
+    return extra_headers_handler
+
 
 def ia_client(extra_headers):
     s = boto3.Session(
@@ -40,17 +43,33 @@ def ia_client(extra_headers):
         )
 
     if extra_headers:
-        handler = make_add_headers_handler(extra_headers)
-        s.events.register("before-call.s3.CreateMultipartUpload", handler)
-        s.events.register("before-call.s3.CompleteMultipartUpload", handler)
+        handler = make_extra_headers_handler(extra_headers)
+        for operation in ["CreateMultipartUpload", "CompleteMultipartUpload",
+                          "UploadPart", "PutObject"]:
+            s.events.register("before-call.s3.{}".format(operation), handler)
 
     c = s.client("s3",
                  # Explicit http:// here disables TLS
                  endpoint_url="http://s3.us.archive.org",
                  # Disable host-based addressing (equivalent of
                  # calling_format=OrdinaryCallingFormat() in boto 2)
+                 # XX FIXME: poking at <item>.s3.us.archive.org suggests that
+                 # archive.org has implemented the default dns-based
+                 # addressing style?
                  config=Config(s3={"addressing_style": "path"}),
                  )
+
+    # XX FIXME HACK: monkeypatch boto3 so that it doesn't include an
+    # xmlns="..." attribute on the CompleteMultipartUpload payload. As of
+    # 2016-03-17, the inclusion of the xmlns="..." breaks the archive.org S3
+    # implementation. This has been reported to archive.org and should be
+    # fixed soon.
+    del (c._service_model._shape_resolver._shape_map
+         ["CompleteMultipartUploadRequest"]
+         ["members"]
+         ["MultipartUpload"]
+         ["xmlNamespace"])
+
     return c
 
 
@@ -62,14 +81,12 @@ DEFAULT_HEADERS = {
 }
 
 def ia_transfer(chunksize, max_concurrency, extra_headers):
-    # We always go through the multipart upload path, to make things simpler
-    # (e.g. this way we only have to worry about overriding the HTTP headers
-    # for multipart uploads, not regular uploads)
-    config = TransferConfig(multipart_threshold=0,
+    config = TransferConfig(multipart_threshold=chunksize,
                             multipart_chunksize=chunksize,
                             max_concurrency=max_concurrency)
     client = ia_client(extra_headers)
     return S3Transfer(client, config)
+
 
 class RateLimiter(object):
     def __init__(self, min_update_interval_seconds):
@@ -99,23 +116,29 @@ class UploadProgressBar(object):
         if not force and not self._rate_limiter.ready():
             return
 
-        percent = 100.0 * self._transferred / self._size
+        percent = 100 * self._transferred / self._size
         MB = self._transferred / 1e6
         duration = time.time() - self._start
         rate = MB / duration
+        remaining_bytes = self._size - self._transferred
+        remaining_sec = duration * remaining_bytes / self._transferred
+        remaining_min = remaining_sec / 60
         self._out.write("{local_filename}: {percent:.2f}%, {MB:.1f} MB in "
-                        "{duration:.1f} s, {rate:.1f} MB/s\n"
+                        "{duration:.1f} s, {rate:.1f} MB/s "
+                        "(eta: {remaining_min:.2f} min)\n"
                         .format(local_filename=self._local_filename,
                                 percent=percent,
                                 MB=MB,
                                 duration=duration,
-                                rate=rate))
+                                rate=rate,
+                                remaining_min=remaining_min))
 
         self._rate_limiter.reset()
 
     def transfer_callback(self, bytes):
         self._transferred += bytes
         self.redraw()
+
 
 def ia_upload(local_filename, ia_item_name, remote_filename,
               # 1 gigabyte
@@ -131,6 +154,7 @@ def ia_upload(local_filename, ia_item_name, remote_filename,
                          callback=progress_bar.transfer_callback)
     progress_bar.redraw(force=True)
 
+
 def expand_filename(local_filename):
     if os.path.isdir(local_filename):
         for root, _, leaf_filenames in os.walk(local_filename):
@@ -139,51 +163,10 @@ def expand_filename(local_filename):
     else:
         yield local_filename
 
+
 def ia_upload_all(filenames_or_dirs, ia_item_name, **kwargs):
     if isinstance(filenames_or_dirs, str):
         filenames_or_dirs = [filenames_or_dirs]
     for filename_or_dir in filenames_or_dirs:
         for filename in expand_filename(filename_or_dir):
             ia_upload(filename, ia_item_name, filename, **kwargs)
-
-# loop over files, pick target name, start multipart upload
-# track pieces in flight and when each upload finishes mark it complete; abort
-# all partial uploads if die
-
-# from s3.transfer import ReadFileChunk
-# # will automatically trim chunk_size if it goes past end of file
-# # and will automatically propagate the actual size through so we don't have to
-# # set ContentLength manually.
-# # This is a context manager, naturally
-# f = ReadFileChunk.from_filename(filename, start_byte, chunk_size,
-#                                 callback=foo, enable_callback=True)
-# # will call foo(bytes_read) whenever bytes are read
-# # note that bytes_read can be negative e.g. if got redirected and have to
-# # start uploading again
-
-# client.create_multipart_upload
-# r = client.upload_part(Bucket, Key, UploadId, PartNumber, Body, **extra_args)
-# etag = r["ETag"]
-
-# Body can be a "seekable file-like object",
-# ContentLength can be specified
-# ContentMD5 -- don't think we care
-#
-
-# client.complete_multipart_upload(
-#     Bucket, Key, UploadId,
-#     MultipartUpload={"Parts":
-#                      [{"ETag": ..., "PartNumber": ...},
-#                       ...]})
-# client.abort_multipart_upload(...)
-
-# def upload_part(upload_id, filename, key, callback, extra
-
-# class MultipartUploadTracker(object):
-#     def __init__(self):
-#         self._in_flight = []
-
-
-
-
-#
