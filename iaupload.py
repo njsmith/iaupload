@@ -217,10 +217,24 @@ def accesskey_tasks_queued():
     # exactly the right thing (we really want to know how many tasks are
     # queued for the bucket we're uploading to, not for the current
     # accesskey). But I can't figure out a better way to do it...
-    r = requests.get("http://s3.us.archive.org/?check_limit=1&accesskey={}"
-                     .format(os.environ["IA_ACCESS_KEY_ID"]))
-    #print("  debug: {!r}".format(r.json()))
-    return r.json()["detail"]["accesskey_tasks_queued"]
+    while True:
+        # It's a fairly regular occurrence for these requests to come back:
+        #   <html><body>
+        #     <h1>503 Service Unavailable</h1>
+        #     No server is available to handle this request.
+        #   </body></html>
+        # So retry in a loop.
+        try:
+            r = requests.get("http://s3.us.archive.org/?check_limit=1&accesskey={}"
+                             .format(os.environ["IA_ACCESS_KEY_ID"]))
+            #print("  debug: {!r}".format(r.json()))
+            return r.json()["detail"]["accesskey_tasks_queued"]
+        except Exception as e:
+            print("  error fetching queue information:\n"
+                  "    Exception: {}\n"
+                  "    Body: {!r}\n"
+                  "  will try again..."
+                  .format(e, r.content))
 
 
 def wait_for_queue_drain(ia_item_name):
